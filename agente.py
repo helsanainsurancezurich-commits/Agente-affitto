@@ -1,4 +1,4 @@
-import json, math, os, re, requests
+import json, math, os, re, sys, requests
 from datetime import datetime, timedelta, timezone, date
 
 # ================= CONFIG =================
@@ -11,11 +11,13 @@ MIN_MQ = 60
 MAX_ETA_GIORNI = 60
 INGRESSO_DA = date(2026, 12, 1)
 INGRESSO_A = date(2027, 4, 30)
+MAX_PER_RUN = 15
+BBOX = {"west": 8.35, "east": 8.73, "south": 47.25, "north": 47.50}
 SEEN_FILE = "seen.json"
 
 SCARTA = ["zwischenmiete", "untermiete", "sublet", "wg-zimmer", "wohngemeinschaft",
-          "nur für studenten", "nur an studierende"]
-AVVISI = ["befristet", "zeitlich begrenzt", "möbliert", "nachmieter", "lärm",
+          "nur für studenten", "nur an studierende", "wohnungstausch", "tauschwohnung"]
+AVVISI = ["befristet", "zeitlich begrenzt", "nachmieter", "lärm",
           "strassenlärm", "erdgeschoss", "parterre", "keine haustiere", "haustiere nicht"]
 CUCINA = ["küche", "einbauküche", "geschirrspüler", "kochinsel", "wohnküche"]
 # ==========================================
@@ -57,7 +59,7 @@ def telegram(testo):
 
 def parse_dt(s):
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
     except Exception:
         return None
 
@@ -67,29 +69,57 @@ def parse_data(s):
     except Exception:
         return None
 
+def lista(dati):
+    return dati if isinstance(dati, list) else dati.get("results", [])
+
 seen = set(map(str, json.load(open(SEEN_FILE)))) if os.path.exists(SEEN_FILE) else set()
 
-r = requests.get("https://flatfox.ch/api/v1/public-listing/",
-                 params={"offer_type": "RENT", "object_category": "APARTMENT",
-                         "limit": 100, "ordering": "-created"}, timeout=30)
-r.raise_for_status()
-annunci = r.json().get("results", [])
-if annunci:
-    print("CAMPI:", sorted(annunci[0].keys()))
-    print("ESEMPIO:", {k: annunci[0].get(k) for k in ["pk", "rent_gross", "price_display", "number_of_rooms", "surface_living", "latitude", "longitude", "city", "created", "moving_date", "street", "zipcode", "url"]})
-vicini = [a for a in annunci if a.get("latitude") and a.get("longitude") and km(a["latitude"], a["longitude"]) <= RAGGIO_KM]
-print("Entro raggio:", len(vicini), "| di cui 3-4.5 locali:", len([a for a in vicini if 3 <= float(a.get("number_of_rooms") or 0) <= 4.5]))
+# 1) ricerca per zona/prezzo/locali (endpoint mappa di Flatfox)
+rp = requests.get("https://flatfox.ch/api/v1/pin/",
+                  params={"offer_type": "RENT", "object_category": "APARTMENT",
+                          "max_price": MAX_PREZZO, "min_rooms": MIN_LOCALI,
+                          "max_rooms": MAX_LOCALI, "max_count": 400, **BBOX}, timeout=40)
+print("PIN status:", rp.status_code)
+if not rp.ok:
+    print(rp.text[:500])
+    sys.exit(1)
+pins = lista(rp.json())
+print("PIN totali:", len(pins), "| esempio:", pins[0] if pins else None)
+pks = [p.get("pk") for p in pins if p.get("pk") is not None]
+nuovi_pks = [pk for pk in pks if str(pk) not in seen]
+print("Nuovi da controllare:", len(nuovi_pks))
+
+# 2) dettagli solo dei nuovi
+annunci = []
+for i in range(0, len(nuovi_pks), 30):
+    chunk = nuovi_pks[i:i + 30]
+    rd = requests.get("https://flatfox.ch/api/v1/public-listing/",
+                      params=[("pk", pk) for pk in chunk] + [("limit", 100)], timeout=40)
+    if rd.ok:
+        insieme = set(chunk)
+        annunci += [a for a in lista(rd.json()) if a.get("pk") in insieme]
+print("Dettagli ottenuti:", len(annunci))
+if nuovi_pks and not annunci:
+    print("Nessun dettaglio ottenuto: il filtro per pk potrebbe non funzionare")
+    sys.exit(1)
+
 adesso = datetime.now(timezone.utc)
 nuovi = 0
 
 for a in annunci:
+    if nuovi >= MAX_PER_RUN:
+        break                      # gli altri restano "non visti" e arrivano al prossimo giro
     pk = str(a.get("pk"))
-    if pk in seen:
-        continue
     seen.add(pk)
 
+    if a.get("reserved") or a.get("is_swap"):
+        continue
     try:
-        prezzo = a.get("rent_gross") or a.get("price_display")
+        prezzo = a.get("rent_gross")
+        if not prezzo and a.get("rent_net") is not None:
+            prezzo = a["rent_net"] + (a.get("rent_charges") or 0)
+        if not prezzo:
+            prezzo = a.get("price_display")
         locali = float(a.get("number_of_rooms") or 0)
         lat, lon = a.get("latitude"), a.get("longitude")
         mq = a.get("surface_living")
@@ -105,7 +135,7 @@ for a in annunci:
     except (TypeError, ValueError):
         continue
 
-    creato = parse_dt(a.get("created") or "")
+    creato = parse_dt(a.get("published") or a.get("created") or "")
     eta = (adesso - creato).days if creato else None
     if eta is not None and eta > MAX_ETA_GIORNI:
         continue
@@ -115,7 +145,7 @@ for a in annunci:
         continue
 
     chiave = f"{a.get('street')}|{a.get('zipcode')}|{locali}|{prezzo}"
-    if chiave in seen:
+    if a.get("street") and chiave in seen:
         continue
     seen.add(chiave)
 
@@ -128,6 +158,10 @@ for a in annunci:
         continue
 
     avvisi = [w for w in AVVISI if w in testo]
+    if a.get("is_temporary"):
+        avvisi.append("contratto a termine")
+    if a.get("is_furnished"):
+        avvisi.append("arredato")
     cucina = any(w in testo for w in CUCINA)
     fresco = "🔥 " if (eta is not None and eta < 1) else ""
     prezzo_mq = f" · {prezzo / mq:.0f} CHF/m²" if mq else ""
