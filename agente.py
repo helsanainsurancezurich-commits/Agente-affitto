@@ -74,6 +74,11 @@ r = requests.get("https://flatfox.ch/api/v1/public-listing/",
                          "limit": 100, "ordering": "-created"}, timeout=30)
 r.raise_for_status()
 annunci = r.json().get("results", [])
+if annunci:
+    print("CAMPI:", sorted(annunci[0].keys()))
+    print("ESEMPIO:", {k: annunci[0].get(k) for k in ["pk", "rent_gross", "price_display", "number_of_rooms", "surface_living", "latitude", "longitude", "city", "created", "moving_date", "street", "zipcode", "url"]})
+vicini = [a for a in annunci if a.get("latitude") and a.get("longitude") and km(a["latitude"], a["longitude"]) <= RAGGIO_KM]
+print("Entro raggio:", len(vicini), "| di cui 3-4.5 locali:", len([a for a in vicini if 3 <= float(a.get("number_of_rooms") or 0) <= 4.5]))
 adesso = datetime.now(timezone.utc)
 nuovi = 0
 
