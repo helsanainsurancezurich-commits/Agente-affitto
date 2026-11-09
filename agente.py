@@ -4,16 +4,22 @@ from datetime import datetime, timedelta, timezone, date
 # ================= CONFIG =================
 CENTRO = (47.3769, 8.5417)
 RAGGIO_KM = 14
-MAX_MINUTI_HB = 35
 MAX_PREZZO = 3000
 MIN_LOCALI, MAX_LOCALI = 3.0, 4.5
 MIN_MQ = 60
+MAX_MINUTI_HB = 35
+# tolleranza per gli annunci "quasi giusti" (segnalati con 🟡)
+SOFT_PREZZO = 3150
+SOFT_MQ = 55
+SOFT_MINUTI = 40
+
 MAX_ETA_GIORNI = 60            # consiglio 21 per vedere solo annunci freschi
 INGRESSO_DA = date(2027, 1, 1)
 INGRESSO_A = date(2027, 3, 31)  # metti date(2027, 4, 15) se potete slittare ad aprile
-MESI_MIN_CONTRATTO = 24         # scarta contratti a termine più brevi di 2 anni
-SCARTA_SUBITO = False           # True = scarta anche "ab sofort" senza data
+MESI_MIN_CONTRATTO = 24
+SCARTA_SUBITO = False
 ESCLUDI_CITTA = []              # esempio: ["Kloten", "Opfikon"]
+FIRMA = "Stevenazzi Marta/Riccardo Rivano, Tel. +39 39 260 59 610"   # <-- CAMBIALA
 MAX_PER_CICLO = 15
 DURATA_MIN = 25
 INTERVALLO_SEC = 180
@@ -91,6 +97,22 @@ def parse_data(s):
 def lista(dati):
     return dati if isinstance(dati, list) else dati.get("results", [])
 
+def bozza(a, locali, ingresso):
+    loc = f"{locali:g}"
+    street, zipc, city = a.get("street"), a.get("zipcode"), a.get("city")
+    if street:
+        dove = f" ({street}, {zipc} {city})"
+    else:
+        dove = f" in {city}" if city else ""
+    quando = f"per den {ingresso.strftime('%d.%m.%Y')}" if ingresso else "ab Anfang 2027 (nach Vereinbarung)"
+    return (f"Guten Tag\n\n"
+            f"Wir interessieren uns für Ihre {loc}-Zimmer-Wohnung{dove} und möchten sie gerne {quando} mieten. "
+            f"Wir sind ein Paar (beide Architekten) mit gesichertem Einkommen und gültiger Aufenthaltsbewilligung, "
+            f"suchen langfristig und haben keine Haustiere. Alle Unterlagen (Betreibungsauszug, "
+            f"Einkommensnachweise, Ausweise) können wir sofort einreichen.\n\n"
+            f"Ist der Mietvertrag unbefristet, und wäre eine Besichtigung diese Woche möglich?\n\n"
+            f"Freundliche Grüsse\n{FIRMA}")
+
 def valuta_termine(testo, is_temporary, ingresso):
     """Ritorna ('ok'|'scarta'|'incerto', nota) per i contratti a termine."""
     a_termine = bool(is_temporary) or bool(
@@ -130,7 +152,7 @@ def ciclo(seen):
     for west, east, south, north in TILES:
         rp = requests.get("https://flatfox.ch/api/v1/pin/",
                           params={"offer_type": "RENT", "object_category": "APARTMENT",
-                                  "max_price": MAX_PREZZO, "min_rooms": MIN_LOCALI,
+                                  "max_price": SOFT_PREZZO, "min_rooms": MIN_LOCALI,
                                   "max_rooms": MAX_LOCALI, "max_count": MAX_PIN,
                                   "west": west, "east": east, "south": south, "north": north},
                           timeout=40)
@@ -169,6 +191,7 @@ def ciclo(seen):
             continue
         if str(a.get("city") or "").lower() in [c.lower() for c in ESCLUDI_CITTA]:
             continue
+        fuori = []   # limiti superati di poco (annuncio "quasi giusto")
         try:
             prezzo = a.get("rent_gross")
             if not prezzo and a.get("rent_net") is not None:
@@ -180,10 +203,14 @@ def ciclo(seen):
             mq = a.get("surface_living")
             if not (prezzo and lat and lon):
                 continue
-            if prezzo > MAX_PREZZO or not (MIN_LOCALI <= locali <= MAX_LOCALI):
+            if prezzo > SOFT_PREZZO or not (MIN_LOCALI <= locali <= MAX_LOCALI):
                 continue
+            if mq and mq < SOFT_MQ:
+                continue
+            if prezzo > MAX_PREZZO:
+                fuori.append(f"prezzo {prezzo} CHF (limite {MAX_PREZZO})")
             if mq and mq < MIN_MQ:
-                continue
+                fuori.append(f"{mq} m² (minimo {MIN_MQ})")
             d = km(lat, lon)
             if d > RAGGIO_KM:
                 continue
@@ -216,8 +243,11 @@ def ciclo(seen):
             continue
 
         minuti = minuti_a_hb(lat, lon)
-        if minuti is not None and minuti > MAX_MINUTI_HB:
-            continue
+        if minuti is not None:
+            if minuti > SOFT_MINUTI:
+                continue
+            if minuti > MAX_MINUTI_HB:
+                fuori.append(f"{minuti} min a HB (limite {MAX_MINUTI_HB})")
 
         avvisi = [w for w in AVVISI if w in testo]
         if nota:
@@ -231,10 +261,12 @@ def ciclo(seen):
             avvisi.append("piano terra")
         cucina = any(w in testo for w in CUCINA)
         fresco = "🔥 " if (eta is not None and eta < 1) else ""
+        bollino = "🟡 " if fuori else ""
         prezzo_mq = f" · {prezzo / mq:.0f} CHF/m²" if mq else ""
 
-        msg = (f"{fresco}🏠 {a.get('short_title') or a.get('public_title')}\n"
-               f"{locali} locali · {mq or '?'} m² · {prezzo} CHF{prezzo_mq}\n"
+        msg = (f"{bollino}{fresco}🏠 {a.get('short_title') or a.get('public_title')}\n"
+               + (f"🟡 Fuori di poco: {', '.join(fuori)}\n" if fuori else "")
+               + f"{locali} locali · {mq or '?'} m² · {prezzo} CHF{prezzo_mq}\n"
                f"{a.get('city')} · {d:.1f} km · "
                f"{str(minuti) + ' min a HB' if minuti is not None else 'tempo HB n/d'}\n"
                f"Ingresso: {ingresso or 'non indicato'} · online da: "
@@ -244,6 +276,7 @@ def ciclo(seen):
                + "https://flatfox.ch" + a.get("url", ""))
         if telegram(msg):
             nuovi += 1
+            telegram("✉️ Bozza di risposta (copia e incolla):\n\n" + bozza(a, locali, ingresso))
         else:
             seen.discard(pk)
             seen.discard(chiave)
