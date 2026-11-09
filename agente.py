@@ -8,24 +8,26 @@ MAX_MINUTI_HB = 35
 MAX_PREZZO = 3000
 MIN_LOCALI, MAX_LOCALI = 3.0, 4.5
 MIN_MQ = 60
-MAX_ETA_GIORNI = 60
-INGRESSO_DA = date(2026, 12, 1)
-INGRESSO_A = date(2027, 4, 30)
+MAX_ETA_GIORNI = 60            # consiglio 21 per vedere solo annunci freschi
+INGRESSO_DA = date(2027, 1, 1)
+INGRESSO_A = date(2027, 3, 31)  # metti date(2027, 4, 15) se potete slittare ad aprile
+MESI_MIN_CONTRATTO = 24         # scarta contratti a termine più brevi di 2 anni
+SCARTA_SUBITO = False           # True = scarta anche "ab sofort" senza data
+ESCLUDI_CITTA = []              # esempio: ["Kloten", "Opfikon"]
 MAX_PER_CICLO = 15
-DURATA_MIN = 25          # minuti di attività per ogni esecuzione
-INTERVALLO_SEC = 180     # controllo ogni 3 minuti
+DURATA_MIN = 25
+INTERVALLO_SEC = 180
 MAX_PIN = 1000
 SEEN_FILE = "seen.json"
 
-# zona divisa in 4 riquadri (ovest, est, sud, nord)
 W, E, S, N = 8.35, 8.73, 47.25, 47.50
 MLON, MLAT = (W + E) / 2, (S + N) / 2
 TILES = [(W, MLON, S, MLAT), (MLON, E, S, MLAT), (W, MLON, MLAT, N), (MLON, E, MLAT, N)]
 
 SCARTA = ["zwischenmiete", "untermiete", "sublet", "wg-zimmer", "wohngemeinschaft",
           "nur für studenten", "nur an studierende", "wohnungstausch", "tauschwohnung"]
-AVVISI = ["befristet", "zeitlich begrenzt", "nachmieter", "lärm",
-          "strassenlärm", "keine haustiere", "haustiere nicht"]
+AVVISI = ["nachmieter", "lärm", "strassenlärm", "keine haustiere", "haustiere nicht"]
+SUBITO = ["ab sofort", "per sofort", "sofort bezugsbereit", "sofort verfügbar", "sofort frei"]
 CUCINA = ["küche", "einbauküche", "geschirrspüler", "kochinsel", "wohnküche"]
 # ==========================================
 
@@ -89,11 +91,41 @@ def parse_data(s):
 def lista(dati):
     return dati if isinstance(dati, list) else dati.get("results", [])
 
+def valuta_termine(testo, is_temporary, ingresso):
+    """Ritorna ('ok'|'scarta'|'incerto', nota) per i contratti a termine."""
+    a_termine = bool(is_temporary) or bool(
+        re.search(r"(?<!un)befristet|zeitlich begrenzt|fixed[- ]term", testo))
+    if not a_termine:
+        return "ok", ""
+    inizio = ingresso or INGRESSO_DA
+    base = r"(?:(?<!un)befristet|zeitlich begrenzt|mietdauer|laufzeit)[^\n]{0,60}?"
+    mesi = None
+    try:
+        m = re.search(base + r"(\d{1,2})\.(\d{1,2})\.(20\d\d)", testo)
+        if m:
+            fine = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            mesi = (fine.year - inizio.year) * 12 + fine.month - inizio.month
+        else:
+            m = re.search(base + r"(\d{1,2})\.(20\d\d)", testo)
+            if m:
+                mesi = (int(m.group(2)) - inizio.year) * 12 + int(m.group(1)) - inizio.month
+            else:
+                m = re.search(base + r"(\d+)\s*(jahr|monat)", testo)
+                if m:
+                    n = int(m.group(1))
+                    mesi = n * 12 if m.group(2) == "jahr" else n
+    except ValueError:
+        mesi = None
+    if mesi is not None:
+        if mesi < MESI_MIN_CONTRATTO:
+            return "scarta", f"termine tra {mesi} mesi"
+        return "ok", f"contratto a termine (circa {mesi} mesi)"
+    return "incerto", "contratto a termine: durata da verificare"
+
 def salva(seen):
     json.dump(sorted(seen)[-8000:], open(SEEN_FILE, "w"))
 
 def ciclo(seen):
-    # 1) ricerca per zona/prezzo/locali, 4 riquadri uniti
     pins = {}
     for west, east, south, north in TILES:
         rp = requests.get("https://flatfox.ch/api/v1/pin/",
@@ -114,7 +146,6 @@ def ciclo(seen):
     nuovi_pks = [pk for pk in pins if str(pk) not in seen]
     print(f"PIN totali: {len(pins)} | nuovi da controllare: {len(nuovi_pks)}")
 
-    # 2) dettagli solo dei nuovi
     annunci = []
     for i in range(0, len(nuovi_pks), 30):
         chunk = nuovi_pks[i:i + 30]
@@ -123,7 +154,6 @@ def ciclo(seen):
         if rd.ok:
             insieme = set(chunk)
             annunci += [a for a in lista(rd.json()) if a.get("pk") in insieme]
-    # i più recenti per primi
     annunci.sort(key=lambda a: str(a.get("published") or a.get("created") or ""), reverse=True)
     print("Dettagli ottenuti:", len(annunci))
 
@@ -131,11 +161,13 @@ def ciclo(seen):
     nuovi = 0
     for a in annunci:
         if nuovi >= MAX_PER_CICLO:
-            break                      # gli altri restano "non visti" e arrivano al ciclo dopo
+            break
         pk = str(a.get("pk"))
         seen.add(pk)
 
         if a.get("reserved") or a.get("is_swap"):
+            continue
+        if str(a.get("city") or "").lower() in [c.lower() for c in ESCLUDI_CITTA]:
             continue
         try:
             prezzo = a.get("rent_gross")
@@ -176,13 +208,22 @@ def ciclo(seen):
         if any(w in testo for w in SCARTA):
             continue
 
+        stato, nota = valuta_termine(testo, a.get("is_temporary"), ingresso)
+        if stato == "scarta":
+            continue
+        subito = ingresso is None and any(w in testo for w in SUBITO)
+        if subito and SCARTA_SUBITO:
+            continue
+
         minuti = minuti_a_hb(lat, lon)
         if minuti is not None and minuti > MAX_MINUTI_HB:
             continue
 
         avvisi = [w for w in AVVISI if w in testo]
-        if a.get("is_temporary"):
-            avvisi.append("contratto a termine")
+        if nota:
+            avvisi.append(nota)
+        if subito:
+            avvisi.append("disponibile subito (data non indicata)")
         if a.get("is_furnished"):
             avvisi.append("arredato")
         piano = a.get("floor")
@@ -204,7 +245,6 @@ def ciclo(seen):
         if telegram(msg):
             nuovi += 1
         else:
-            # consegna fallita: non segnarlo come visto, ci riprova al prossimo ciclo
             seen.discard(pk)
             seen.discard(chiave)
             print("Consegna fallita, riprovo al prossimo ciclo")
