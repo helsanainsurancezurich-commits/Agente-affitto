@@ -3,22 +3,21 @@ from datetime import datetime, timedelta, timezone, date
 
 # ================= CONFIG =================
 CENTRO = (47.3769, 8.5417)
-RAGGIO_KM = 14
-MAX_PREZZO = 3000
+MAX_PREZZO = 3000                 # limite rigido, spese comprese
 MIN_LOCALI, MAX_LOCALI = 3.0, 4.5
-MIN_MQ = 60
+MIN_MQ = 50                       # se i m² non sono indicati, l'annuncio passa con avviso
 MAX_MINUTI_HB = 35
-# tolleranza per gli annunci "quasi giusti" (segnalati con 🟡)
-SOFT_PREZZO = 3150
-SOFT_MQ = 55
-SOFT_MINUTI = 40
-
-MAX_ETA_GIORNI = 60            # consiglio 21 per vedere solo annunci freschi
-INGRESSO_DA = date(2027, 1, 1)
-INGRESSO_A = date(2027, 3, 31)  # metti date(2027, 4, 15) se potete slittare ad aprile
+SOFT_MINUTI = 40                  # tolleranza 🟡 solo sui minuti
+ZIP_PREFISSI = ("80",)            # CAP ammessi: solo Zurigo città (80XX)
+# per aggiungere comuni, esempio: ("80", "8304", "8600", "8952", "8152")
+SCARTA_TERMINE_TUTTI = True       # True = scarta ogni contratto a termine
+                                  # False = scarta solo quelli sotto i 24 mesi
 MESI_MIN_CONTRATTO = 24
+MAX_ETA_GIORNI = 60               # consiglio 21 per vedere solo annunci freschi
+INGRESSO_DA = date(2027, 1, 1)
+INGRESSO_A = date(2027, 3, 31)    # metti date(2027, 4, 15) se potete slittare ad aprile
 SCARTA_SUBITO = False
-ESCLUDI_CITTA = []              # esempio: ["Kloten", "Opfikon"]
+ESCLUDI_CITTA = []
 FIRMA = "Stevenazzi Marta/Riccardo Rivano, Tel. +39 39 260 59 610"   # <-- CAMBIALA
 MAX_PER_CICLO = 15
 DURATA_MIN = 25
@@ -26,7 +25,8 @@ INTERVALLO_SEC = 180
 MAX_PIN = 1000
 SEEN_FILE = "seen.json"
 
-W, E, S, N = 8.35, 8.73, 47.25, 47.50
+# riquadro che copre la città di Zurigo, diviso in 4
+W, E, S, N = 8.42, 8.65, 47.30, 47.45
 MLON, MLAT = (W + E) / 2, (S + N) / 2
 TILES = [(W, MLON, S, MLAT), (MLON, E, S, MLAT), (W, MLON, MLAT, N), (MLON, E, MLAT, N)]
 
@@ -97,6 +97,16 @@ def parse_data(s):
 def lista(dati):
     return dati if isinstance(dati, list) else dati.get("results", [])
 
+def cap_ok(a):
+    z = str(a.get("zipcode") or "").strip()
+    if z:
+        return z.startswith(ZIP_PREFISSI)
+    return str(a.get("city") or "").lower().startswith(("zürich", "zurich"))
+
+def e_a_termine(a, testo):
+    return bool(a.get("is_temporary")) or bool(
+        re.search(r"(?<!un)befristet|zeitlich begrenzt|fixed[- ]term", testo))
+
 def bozza(a, locali, ingresso):
     loc = f"{locali:g}"
     street, zipc, city = a.get("street"), a.get("zipcode"), a.get("city")
@@ -113,12 +123,8 @@ def bozza(a, locali, ingresso):
             f"Ist der Mietvertrag unbefristet, und wäre eine Besichtigung diese Woche möglich?\n\n"
             f"Freundliche Grüsse\n{FIRMA}")
 
-def valuta_termine(testo, is_temporary, ingresso):
-    """Ritorna ('ok'|'scarta'|'incerto', nota) per i contratti a termine."""
-    a_termine = bool(is_temporary) or bool(
-        re.search(r"(?<!un)befristet|zeitlich begrenzt|fixed[- ]term", testo))
-    if not a_termine:
-        return "ok", ""
+def valuta_termine(testo, ingresso):
+    """Usata solo se SCARTA_TERMINE_TUTTI è False. Ritorna ('ok'|'scarta'|'incerto', nota)."""
     inizio = ingresso or INGRESSO_DA
     base = r"(?:(?<!un)befristet|zeitlich begrenzt|mietdauer|laufzeit)[^\n]{0,60}?"
     mesi = None
@@ -152,7 +158,7 @@ def ciclo(seen):
     for west, east, south, north in TILES:
         rp = requests.get("https://flatfox.ch/api/v1/pin/",
                           params={"offer_type": "RENT", "object_category": "APARTMENT",
-                                  "max_price": SOFT_PREZZO, "min_rooms": MIN_LOCALI,
+                                  "max_price": MAX_PREZZO, "min_rooms": MIN_LOCALI,
                                   "max_rooms": MAX_LOCALI, "max_count": MAX_PIN,
                                   "west": west, "east": east, "south": south, "north": north},
                           timeout=40)
@@ -189,9 +195,10 @@ def ciclo(seen):
 
         if a.get("reserved") or a.get("is_swap"):
             continue
+        if not cap_ok(a):
+            continue
         if str(a.get("city") or "").lower() in [c.lower() for c in ESCLUDI_CITTA]:
             continue
-        fuori = []   # limiti superati di poco (annuncio "quasi giusto")
         try:
             prezzo = a.get("rent_gross")
             if not prezzo and a.get("rent_net") is not None:
@@ -203,17 +210,11 @@ def ciclo(seen):
             mq = a.get("surface_living")
             if not (prezzo and lat and lon):
                 continue
-            if prezzo > SOFT_PREZZO or not (MIN_LOCALI <= locali <= MAX_LOCALI):
+            if prezzo > MAX_PREZZO or not (MIN_LOCALI <= locali <= MAX_LOCALI):
                 continue
-            if mq and mq < SOFT_MQ:
-                continue
-            if prezzo > MAX_PREZZO:
-                fuori.append(f"prezzo {prezzo} CHF (limite {MAX_PREZZO})")
             if mq and mq < MIN_MQ:
-                fuori.append(f"{mq} m² (minimo {MIN_MQ})")
-            d = km(lat, lon)
-            if d > RAGGIO_KM:
                 continue
+            d = km(lat, lon)
         except (TypeError, ValueError):
             continue
 
@@ -235,13 +236,18 @@ def ciclo(seen):
         if any(w in testo for w in SCARTA):
             continue
 
-        stato, nota = valuta_termine(testo, a.get("is_temporary"), ingresso)
-        if stato == "scarta":
-            continue
+        nota = ""
+        if e_a_termine(a, testo):
+            if SCARTA_TERMINE_TUTTI:
+                continue
+            stato, nota = valuta_termine(testo, ingresso)
+            if stato == "scarta":
+                continue
         subito = ingresso is None and any(w in testo for w in SUBITO)
         if subito and SCARTA_SUBITO:
             continue
 
+        fuori = []
         minuti = minuti_a_hb(lat, lon)
         if minuti is not None:
             if minuti > SOFT_MINUTI:
@@ -256,6 +262,10 @@ def ciclo(seen):
             avvisi.append("disponibile subito (data non indicata)")
         if a.get("is_furnished"):
             avvisi.append("arredato")
+        if not mq:
+            avvisi.append("m² non indicati")
+        elif mq < 60:
+            avvisi.append(f"piccolo ({mq} m²)")
         piano = a.get("floor")
         if piano is not None and str(piano) in ("0", "-1"):
             avvisi.append("piano terra")
@@ -267,7 +277,7 @@ def ciclo(seen):
         msg = (f"{bollino}{fresco}🏠 {a.get('short_title') or a.get('public_title')}\n"
                + (f"🟡 Fuori di poco: {', '.join(fuori)}\n" if fuori else "")
                + f"{locali} locali · {mq or '?'} m² · {prezzo} CHF{prezzo_mq}\n"
-               f"{a.get('city')} · {d:.1f} km · "
+               f"{a.get('zipcode') or ''} {a.get('city')} · {d:.1f} km · "
                f"{str(minuti) + ' min a HB' if minuti is not None else 'tempo HB n/d'}\n"
                f"Ingresso: {ingresso or 'non indicato'} · online da: "
                f"{str(eta) + ' gg' if eta is not None else 'n/d'}\n"
